@@ -1,0 +1,631 @@
+#!/usr/bin/python
+
+__PROGNAME = "s3pipe2"
+__PROGVERS = "0.1"
+
+import os, sys, boto.s3.connection, multiprocessing, time
+import argparse, ConfigParser, datetime, hashlib, signal, Queue
+
+from multiprocessing.pool import ThreadPool
+
+# Throw an error message and exit
+def fatal(msg):
+    sys.stderr.write("FATAL: %s\n" % msg)
+    sys.exit(1)
+
+# Get the MD5 hex digest of a given filename
+def md5sum(fileName, blocksize=65536):
+
+    hashVal = hashlib.md5()
+    try:
+        fh = open(fileName, "rb")
+        buf = fh.read(blocksize)
+        while buf:
+            hashVal.update(buf)
+            buf = fh.read(blocksize)
+            
+    except OSError as e:
+        fatal("Can't get md5sum for '%s': %s" % (fileName, e.strerror))
+        
+    return hashVal.hexdigest()
+
+# Don"t allow input on STDIN from a TTY
+def declineTty(handle):
+    if handle.isatty():
+        fatal("Only piped input permitted; no TTY input allowed")
+
+# Check our staging path is writable, then set it up
+def setupStagingPath(cfg):
+
+    # Determine and normalize the pid-specific staging path to use
+    cfg.progStagingPath = os.path.abspath("%s/%s" % 
+        (cfg.staging_path, cfg.progName))
+    cfg.uniqStagingPath = "%s/%s" % (cfg.progStagingPath,  os.getpid())
+
+    # Now try and create the path, with secure privs
+    try:
+        os.makedirs(cfg.uniqStagingPath, 0700)
+    except OSError as e:
+        fatal("Can't create staging path '%s': %s" % 
+            (cfg.uniqStagingPath, e.strerror))
+    
+# Set our our S3 connection
+def s3Connector(cfg):
+    
+    # First determine what credentials we are using.  Use command line cfg,
+    # of they exist.  Fall back to environment variables, and then the
+    # shared AWS credentials file, and ultimately the old-style aws cli
+    # config file
+
+    accessKey = secretKey = region = None
+
+    awsCredentials  = os.getenv("HOME") + "/.aws/credentials"
+    awsConfig       = os.getenv("HOME") + "/.aws/config"
+    awsProfile      = (os.environ["AWS_PROFILE"] 
+                        if "AWS_PROFILE" in os.environ else "Credentials")
+    cFile      = ConfigParser.ConfigParser()
+
+    # Normalize our s3 path, extract our bucket and relative path
+    if cfg.path.startswith("s3://"):
+        cfg.path = cfg.path[5:]
+    cfg.path = cfg.path.lstrip("/")
+
+    if "/" in cfg.path:
+        cfg.bucketName, cfg.relS3path = cfg.path.split("/", 1)
+    else:
+        cfg.bucketName, cfg.relS3path = cfg.path, ""
+
+    # Parse command line cfg.  Make sure neither or both are set
+    if (cfg.access_key == None) + (cfg.secret_key == None) == 1:
+        fatal("Access and secret keys are mutually inclusive.")
+
+    if cfg.access_key != None:
+        accessKey = cfg.access_key
+        secretKey = cfg.secret_key
+
+    # Otherwise inspect environment variables.  Both must be set in order
+    # for them to be considered
+    elif ("AWS_ACCESS_KEY_ID" in os.environ and 
+            "AWS_SECRET_ACCESS_KEY" in os.environ):
+        accessKey = os.environ["AWS_ACCESS_KEY_ID"]
+        secretKey = os.environ["AWS_SECRET_ACCESS_KEY"]
+
+    # Now try and read the AWS credentials file
+    elif (cFile.read(awsCredentials) and 
+            cFile.has_option(awsProfile, "aws_access_key_id") and
+            cFile.has_option(awsProfile, "aws_secret_access_key")):
+        accessKey = cFile.get(awsProfile, "aws_access_key_id") 
+        secretKey = cFile.get(awsProfile, "aws_secret_access_key")
+
+    # Otherwise fall back to the old-style config file
+    elif (cFile.read(awsConfig) and 
+            cFile.has_option("default", "aws_access_key_id") and
+            cFile.has_option("default", "aws_secret_access_key")):
+        accessKey = cFile.get("default", "aws_access_key_id") 
+        secretKey = cFile.get("default", "aws_secret_access_key")
+
+    # Barf!
+    else:
+        fatal("Unable to find any valid AWS credentials!")
+
+    # Okay, now do the same things for the s3 region
+    if cfg.region:
+        region = cfg.region
+
+    elif cFile.read(awsCredentials) and cFile.has_option(awsProfile, "region"):
+        region = cFile.get(awsProfile, "region")
+    
+    elif cFile.read(awsConfig) and cFile.has_option("default", "region"):
+        region = cFile.get("default", "region")
+
+    # Alright, set up the S3 connection
+    try:
+        cfg.s3conn = boto.s3.connect_to_region(region,
+                   aws_access_key_id=accessKey,
+                   aws_secret_access_key=secretKey,
+                   is_secure=True,
+                   calling_format = boto.s3.connection.OrdinaryCallingFormat(),
+               )
+    
+        cfg.bucketObj = cfg.s3conn.get_bucket(cfg.bucketName)
+        cfg.bucketObj.list(cfg.relS3path)
+
+    # Check permissions + bucket existence
+    except AttributeError:
+        fatal("Failed to authenticate with S3 using provided credentials")
+    except boto.exception.S3ResponseError as e:
+        fatal("failed to read bucket %s: %s" % 
+            (cfg.bucketname, str(e).rstrip()))
+
+# Write a message to stderr if we are in verbose mode
+def log(cfg, msg):
+    if cfg.verbose:
+        sys.stderr.write(msg + "\n")
+
+# Our manifest-file class
+class manifest:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.parser = ConfigParser.RawConfigParser()
+        self.mnfstPath = "%s/.manifest" % cfg.uniqStagingPath
+        cfg.numSegments = 0
+        cfg.totalSize = "0 Kb"
+        cfg.uploadCompleted = False
+
+    def set(self, opt, val):
+        self.parser.set(self.cfg.progName, opt, val)
+
+    def get(self, opt, optType=False):
+        try:
+            if optType == "int":
+                return self.parser.getint(self.cfg.progName, opt)
+            elif optType == "bool":
+                return self.parser.getboolean(self.cfg.progName, opt)
+            else:
+                return self.parser.get(self.cfg.progName, opt)
+        except (ConfigParser.NoSectionError, ConfigParser.NoOptionError):
+            fatal("Manifest file missing option '%s'" % opt)
+
+    def setup(self):
+        self.parser.add_section(self.cfg.progName)
+        self.set("version", self.cfg.progVers)
+        self.set("segment_size", self.cfg.segment_size)
+        self.set("upload_began", self.cfg.startTime.isoformat())
+        self.set("completed", "false")
+
+    def upload(self):
+        try:
+            manifestFh = open(self.mnfstPath, "wb")
+            self.parser.write(manifestFh)
+            manifestFh.close()
+            self.cfg.fileQueue.put((self.mnfstPath, md5sum(self.mnfstPath)))
+            self.cfg.numSegments = self.get("num_segments", "int")
+            self.cfg.totalSize = self.get("total_size")
+            self.cfg.uploadCompleted = self.get("completed", "bool")
+
+        except Exception as e:
+            fatal("Unable to upload manifest file %s: %s" % 
+                (self.mnfstPath, str(e)))
+        
+        self.report()
+
+
+    def download(self):
+        try:
+            remoteFile = "%s/.manifest" % self.cfg.relS3path
+            mnfstKey = self.cfg.bucketObj.get_key(remoteFile)
+            mnfstKey.get_contents_to_filename(self.mnfstPath)
+            self.parser.read(self.mnfstPath)
+            self.cfg.numSegments = self.get("num_segments", "int")
+            self.cfg.totalSize = self.get("total_size")
+            self.cfg.uploadCompleted = self.get("completed", "bool")
+
+        except (boto.exception.S3ResponseError, Exception) as e:
+            fatal("Failed to retrieve manifest %s: %s" % 
+                (remoteFile, str(e).rstrip()))
+
+        self.report()
+
+    def report(self):
+        # Print manifest info to stdout if we are verbose
+        if self.cfg.verbose:
+            sys.stderr.write(
+                "S3 info     : %s segments, %s total size, completed: %s\n" %
+                (self.cfg.numSegments, 
+                self.cfg.totalSize, 
+                self.cfg.uploadCompleted)
+            )
+            
+
+# Download a manifest file and push all undownloaded segments onto our 
+# downloader queue
+def populateDlQueue(cfg):
+
+    manifestObj = manifest(cfg)
+    manifestObj.download()
+
+    # Determine where to start importing from
+    lower = cfg.mostRecentSegment if "mostRecentSegment" in cfg else 0
+
+    # Now start adding things to our queue, if needbe
+    for i in xrange(lower+1, cfg.numSegments+1):
+        cfg.dlQueue.put(i) 
+
+    cfg.mostRecentSegment = cfg.numSegments
+        
+
+# Worker process: Read from STDIN, write to our staging directory
+def stdinReader(cfg):
+
+    # Disable buffering and set binary reads on STDIN
+    stdin = os.fdopen(sys.stdin.fileno(), "rb", 0)
+
+    # Mark our start time
+    cfg.startTime = datetime.datetime.now()
+
+    # Prep our manifest data (let"s cheat and use the python config parser)
+    cfg.manifestObj = manifest(cfg)
+    cfg.manifestObj.setup()
+
+    # Now read our STDIN stream until the cows come home
+    thisSegment = 0
+    bufSizeBytes = cfg.buffer_size * 1000
+    readsPerSegment = cfg.segment_size / cfg.buffer_size * 1000
+    totalSize = 0
+
+    # Keep reading until our input buffer is empty (i.e. EOF)
+    while True:
+        # Open our output segment file
+        thisSegment += 1
+        localFile = cfg.fnFormat % (cfg.uniqStagingPath, thisSegment)
+        try:
+            localFh = open(localFile, "wb")
+            hasher = hashlib.md5()
+            log(cfg, "Writing     : %s" % localFile)
+        except Exception as e:
+            fatal("Failed to open %s: %s" % (localFile, e.strerror))
+
+        # Make sure each of our segments is the  appropriate size
+        for _ in xrange(readsPerSegment):
+            buf = stdin.read(bufSizeBytes)
+
+            # Check for EOF
+            if not len(buf):
+                break
+
+            localFh.write(buf)
+            hasher.update(buf)
+            totalSize += len(buf)
+
+        # close things up and add the file to our upload queue
+        localFh.close()
+        cfg.fileQueue.put((localFile, hasher.hexdigest()))
+
+        # Check for EOF again
+        if not len(buf):
+            break
+
+        # Update our manifest file occasionally
+        if not thisSegment % cfg.num_workers:
+            cfg.manifestObj.set("num_segments", thisSegment)
+            cfg.manifestObj.set("total_size", totalSize)
+            cfg.manifestObj.upload()
+
+    # Are we all done?  Okay, wait until our queue is drained, and then
+    # write our final manifest file
+    cfg.fileQueue.join()
+    cfg.endTime = datetime.datetime.now()
+    cfg.manifestObj.set("num_segments", thisSegment)
+    cfg.manifestObj.set("total_size", totalSize)
+    cfg.manifestObj.set("upload_ended", cfg.endTime.isoformat())
+    cfg.manifestObj.set("completed", "true")
+    cfg.manifestObj.upload()
+    
+    # Close STDIN so upstream progs can get on with their business
+    stdin.close()
+
+    # Shut down our s3 workers
+    for _ in xrange(cfg.num_workers):
+        cfg.fileQueue.put((None, None))
+            
+    # Wait for our workers to finish
+    cfg.fileQueue.join()
+
+    return
+
+# Worker process: Upload files from our staging directory to S3
+def s3uploader(cfg):
+
+    # Watch our file queue and upload files as they get finished
+    while True:
+
+        # Pop a filepath and its MD5 from our work queue
+        localFile, localMd5 = cfg.fileQueue.get()
+
+        # Exit if our upstream stdinReader has finished
+        if localFile is None:
+            cfg.fileQueue.task_done()
+            return
+
+        # Now fetch the file requested
+        baseName = localFile.rsplit("/", 1)[1]
+        remoteFile = "%s/%s" % (cfg.relS3path, baseName)
+        uploadFile(cfg, localFile, localMd5, remoteFile)
+
+        # Clean up after we are done uploading
+        try:
+            os.unlink(localFile)
+
+        except Exception as e:
+            fatal("Unable to remove %s: %s" % (localFile, str(e)))
+
+        cfg.fileQueue.task_done()
+
+
+# Worker process: write files from our staging directory to STDOUT
+def stdoutWriter(cfg):
+
+    # Disable buffering and set binary reads on STDOUT
+    stdout = os.fdopen(sys.stdout.fileno(), "wb", 0)
+
+    # Our outbound file queue.  Really  just used as a placeholder to
+    # hold files that have been downloaded but which aren"t our next
+    # segment that we need (this happens with more than one downloader)
+    outQueue = []
+
+    bufSizeBytes = cfg.buffer_size * 1000
+
+    while True:                                    
+
+        # Try to pop the next file to download, but only wait
+        # up to 5 seconds.  Otherwise re-download the manifest to 
+        # see if there are new segments available to download
+        try:
+            segmentNum = cfg.fileQueue.get(True, 5)
+        except Queue.Empty:
+            populateDlQueue(cfg)
+            continue
+
+        # Make sure that we send the next contiguous segment to stdout and 
+        # that we dont send them to stdout out of order
+        outQueue.append(segmentNum)
+        outQueue.sort(reverse=True)
+
+        while outQueue and outQueue[-1] == cfg.lastWritten+1:
+
+            thisSegment = outQueue.pop()
+            localFile = cfg.fnFormat % (cfg.uniqStagingPath, thisSegment)
+
+            # Okay read our next segment file from the staging directory
+            # and send it to stdout, then delete it
+            buf = None
+            try:
+                log(cfg, "Outputting  : %s" % localFile)
+                localFh = open(localFile, "rb", 0)
+                buf = localFh.read(bufSizeBytes)
+                while len(buf):
+                    stdout.write(buf)
+                    buf = localFh.read(bufSizeBytes)
+                    
+                localFh.close()
+                os.unlink(localFile)
+
+            except Exception as e:
+                fatal("Unable to write %s to stdout: %s" % (localFile, str(e)))
+
+            # Decrement our files-on-disk counter so our downloaders can
+            # fetch new files
+            with cfg.filesOnDisk.get_lock():
+                cfg.filesOnDisk.value -= 1
+
+            cfg.lastWritten = thisSegment
+            cfg.fileQueue.task_done()
+
+            # If this our last segment, exit our writer routine
+            if cfg.uploadCompleted and thisSegment == cfg.numSegments:
+                stdout.close()
+                return
+
+# Worker process: download files from S3 to our staging directory
+def s3downloader(cfg):
+
+
+    # Watch our file queue and download files as they get finished
+    while True:
+        # Snatch the next available file to downlaod from our
+        # file download queue
+        thisSegment = cfg.dlQueue.get()
+
+        # Exit if requested
+        if thisSegment is None:
+            return
+        
+        # Make sure that we aren"t going to flood the disk with
+        # files if we are downloading faster than we are writing
+        # to stdout
+        while True:
+            with cfg.filesOnDisk.get_lock():
+                if cfg.filesOnDisk.value < cfg.num_workers:
+                    cfg.filesOnDisk.value += 1
+                    break
+                time.sleep(1)
+
+        # Now download the file
+        remoteFile = cfg.fnFormat % (cfg.relS3path, thisSegment)
+        localFile = cfg.fnFormat % (cfg.uniqStagingPath, thisSegment)
+
+        downloadFile(cfg, remoteFile, localFile)
+
+        # Stick the completed file on our stdout queue
+        cfg.fileQueue.put(thisSegment)
+
+
+# Upload a file to s3
+def uploadFile(cfg, localFile, localMd5, remoteFile):
+
+    # Try a limited number of times to upload data before giving up
+    log(cfg, "Uploading   : %s (%s)" % (localFile, localMd5))
+    tries = 0
+    while tries < cfg.tries:
+        try:
+            key = cfg.bucketObj.new_key(remoteFile)
+            key.set_contents_from_filename(localFile)
+
+            # Make sure that our local and remote MD5 sums match
+            if key.md5 != localMd5:
+                raise Exception("MD5 mismatch; local: %s, remote: %s" %
+                    (localMd5, key.md5))
+            break
+        except (boto.exception.S3ResponseError, Exception) as e:
+            err = ("Failed to write to s3://%s/%s: %s" % 
+                (cfg.bucketName, remoteFile, str(e).rstrip()))
+
+        tries += 1
+
+    # Die if we exceeded our max attempts
+    if tries == cfg.tries:
+        fatal(err) 
+
+
+# Download a file from s3
+def downloadFile(cfg, remoteFile, localFile):
+
+    # Try a limited number of times to upload data before giving up
+    log(cfg, "Downloading : %s" % remoteFile)
+    tries = 0
+    while tries < cfg.tries:
+        try:
+            key = cfg.bucketObj.get_key(remoteFile)
+            key.get_contents_to_filename(localFile)
+            localMd5 = md5sum(localFile)
+
+            # Make sure that our local and remote MD5 sums match
+            if key.md5 != localMd5:
+                raise Exception("MD5 mismatch; local: %s, remote: %s" %
+                    (localMd5, key.md5))
+            break
+        except (boto.exception.S3ResponseError, Exception) as e:
+            err = ("Failed to read from s3://%s/%s: %s" % 
+                (cfg.bucketName, remoteFile, str(e).rstrip()))
+
+        tries += 1
+
+    # Die if we exceeded our max attempts
+    if tries == cfg.tries:
+        fatal(err) 
+    
+
+# Read from STDIN and write segments that are uploaded to S3
+def fromStdinToS3(cfg):
+
+    # Do setup tasks
+    declineTty(sys.stdin)
+    setupStagingPath(cfg)
+    s3Connector(cfg)
+
+    # Set our worker function references
+    cfg.s3Worker = s3uploader
+    cfg.localWorker = stdinReader
+
+    # Verify that our S3 path is empty
+    keys = cfg.bucketObj.list(cfg.relS3path)
+    notEmpty = False
+    for key in keys:
+        notEmpty = True
+        break
+
+    if notEmpty:
+        fatal("Remote path is not empty; aborting.")
+
+    doWork(cfg)
+
+# Download segments from S3 and send them to STDOUT
+def fromS3ToStdout(cfg):
+
+    # Do setup tasks
+    declineTty(sys.stdout)
+    setupStagingPath(cfg)
+    s3Connector(cfg)
+
+    # Set our worker function references
+    cfg.s3Worker = s3downloader
+    cfg.localWorker = stdoutWriter
+
+    # Set up our download queue
+    cfg.dlQueue = multiprocessing.Queue()
+
+    # Keep track of the last segment written to stdout, so we are sure to
+    # write them out in the proper order
+    cfg.lastWritten = 0
+
+    # Count the number of items that have been downloaded but not written
+    # to stdout (irrespective of whether or not they have been enqueued
+    # or dequeued
+    cfg.filesOnDisk = multiprocessing.Value("i", 0)
+
+    # Grab our manifest and do the initial population of our download queue
+    populateDlQueue(cfg)
+
+    doWork(cfg)
+
+# Worker subroutine to fire off our jobs
+def doWork(cfg):
+
+    # Create our file Queue.  Maximum of 1 file queued at any one time,
+    # since we want to do blocking inserts on it from the reader/writer
+    # worker functions
+    cfg.fileQueue = multiprocessing.JoinableQueue(1)
+
+    # Use a try block to catch and clean up after ctrl-C
+    try:
+        # Start our s3 worker process
+        procPool = ThreadPool(processes=cfg.num_workers, 
+            initializer=cfg.s3Worker, initargs=(cfg,))
+
+        # Read from STDIN/write to STDOUT until EOF
+        cfg.localWorker(cfg)
+
+
+    # Catch that ctrl-c we were talking about
+    except KeyboardInterrupt:
+        pass
+
+    # Clean up our staging directory, starting with straggler files...
+    try:
+        for file in os.listdir(cfg.uniqStagingPath):
+            os.unlink(file)
+        # ... and then removing directories, if empty
+        os.rmdir(cfg.uniqStagingPath)
+        if not len(os.listdir(cfg.progStagingPath)):
+            os.rmdir(cfg.progStagingPath)
+    except:
+        pass
+
+    # Exit successfully
+    sys.exit(0)
+
+# Main/usage sub
+def main():
+
+    parser = argparse.ArgumentParser(
+        prog="%s" % __PROGNAME, 
+        usage=( "%s [options] <to|from> <path>" % __PROGNAME),
+        description="%s v%s: Pipe data to/from AWS S3" % 
+            (__PROGNAME, __PROGVERS))
+    parser.add_argument("-a", dest="access_key", 
+        help="AWS access key to read/write with")
+    parser.add_argument("-s", dest="secret_key", 
+        help="AWS secret key to read/write with")
+    parser.add_argument("-r", dest="region", help="S3 region to use")
+    parser.add_argument("-m", type=int, dest="segment_size", default=100,
+        help="Size in MB of segments to upload (default 100MB)")
+    parser.add_argument("-b", type=int, dest="buffer_size", default=4,
+        help="Size in KB of read/write buffer to use (default 4KB)")
+    parser.add_argument("-p", dest="staging_path", default="/tmp",
+        help="Path to stage segments in")
+    parser.add_argument("-n", type=int, dest="num_workers", default=2,
+        help="# of parallel s3 upload/download workers to run (default 2)")
+    parser.add_argument("-t", type=int, dest="tries", default=3,
+        help="# of times to attempt upload/download before quitting")
+    parser.add_argument("-v", action="store_true", default=False, 
+        dest="verbose", help="Be verbose; print output to stderr")
+    subparsers = parser.add_subparsers(help="Pipe data to/from S3")
+    subparsers.add_parser("to").set_defaults(func=fromStdinToS3)
+    subparsers.add_parser("from").set_defaults(func=fromS3ToStdout)
+    parser.add_argument("path", metavar="path", 
+        help="S3 path to upload/download from")
+    cfg = parser.parse_args()
+
+    # Set our segment name padding to 15 characters
+    cfg.segPadding = 15
+    cfg.fnFormat = "%%s/%%-%s.%sd" % (cfg.segPadding, cfg.segPadding)
+
+    # Set our program name & version
+    cfg.progName = __PROGNAME
+    cfg.progVers = __PROGVERS
+
+    # Call our sub-command routine
+    cfg.func(cfg)
+
+if __name__ == "__main__":
+    main()
